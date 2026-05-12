@@ -165,11 +165,13 @@ def _open_stack(state, direction, ema_timeframe):
     dir_key   = "buy" if direction == BUY else "sell"
     stack_key = f"{dir_key}_stack_open"
 
-    # Don't open if this direction already has a stack
     if state.get(stack_key):
+        print(f"  ⏸️  {dir_key.upper()} stack already flagged open in state")
         return False
 
-    if len(get_bot_positions()) >= CONFIG["max_open_positions"]:
+    current_positions = len(get_bot_positions())
+    if current_positions >= CONFIG["max_open_positions"]:
+        print(f"  ⚠️  Max positions reached ({current_positions}/{CONFIG['max_open_positions']})")
         return False
 
     bot_bal  = state["bot_balance"]
@@ -178,6 +180,7 @@ def _open_stack(state, direction, ema_timeframe):
     dir_str  = "BUY 📈" if direction == BUY else "SELL 📉"
     label    = "buy" if direction == BUY else "sell"
 
+    print(f"  💰 Bot balance: ${bot_bal:.2f} | Base lot: {base_lot}")
     lot_preview = [round(get_greedy_avg_lot(base_lot, i), 2) for i in range(n_burst)]
     print(f"\n🚀 {dir_str} BURST | Firing {n_burst} positions SIMULTANEOUSLY")
     print(f"   Lots: {lot_preview}")
@@ -191,10 +194,11 @@ def _open_stack(state, direction, ema_timeframe):
         state[f"{dir_key}_deep_level"]      = 0
         state[f"{dir_key}_last_deep_price"] = tick.bid
         state[f"{dir_key}_entry_price"]     = tick.bid
-        state["last_stack_direction"]       = int(direction)  # remember for alternation
+        state["last_stack_direction"]       = int(direction)
         state["total_trades"]              += opened
         save_state(state)
         return True
+    print(f"  ❌ All {n_burst} orders failed — check MT5 connection")
     return False
 
 
@@ -289,12 +293,16 @@ def _manage_stack(state, direction, positions):
     # ── DEEP LEVEL ───────────────────────────────────────────
     _try_deep_level(state, direction, positions)
 
-    # ── STATUS ───────────────────────────────────────────────
+    # ── STATUS (throttled — only print when P&L moves $1+) ──────
     symbol_info = mt5.symbol_info(CONFIG["symbol"])
     tick        = mt5.symbol_info_tick(CONFIG["symbol"])
     point       = symbol_info.point if symbol_info else 0.01
 
-    if total_lots > 0:
+    last_pnl_key = f"{dir_key}_last_logged_pnl"
+    last_pnl     = state.get(last_pnl_key)
+    should_log   = (last_pnl is None) or (abs(total_pnl - last_pnl) >= 1.0)
+
+    if should_log and total_lots > 0:
         weighted_entry = sum(p.price_open * p.volume for p in positions) / total_lots
         be_dist        = abs(weighted_entry - tick.bid) / point
         be_dir         = "needs ↑" if direction == BUY else "needs ↓"
@@ -302,6 +310,7 @@ def _manage_stack(state, direction, positions):
         print(f"\n{color} {dir_str} | P&L: ${total_pnl:.2f} | Lots: {total_lots:.2f} | "
               f"{len(positions)} pos (deep:{deep_level}/{max_deep}) | "
               f"BE: {weighted_entry:.2f} ({be_dist:.0f}pts {be_dir})")
+        state[last_pnl_key] = total_pnl
 
     return False
 
@@ -312,16 +321,33 @@ def _manage_stack(state, direction, positions):
 def open_greedy_stack(state, ema_timeframe):
     """
     Opens ONE stack at a time, alternating BUY → SELL → BUY → SELL.
-    Never opens 12 positions simultaneously — only 6 at a time.
-    When a stack closes, the next entry will be the opposite direction.
-    EMA still used as a sanity check — won't open against a strong trend.
     """
     can, reason = _can_enter(state)
     if not can:
+        print(f"  ⏸️  Entry blocked: {reason}")
         return False
 
     # Don't open if any stack is already open
     if state.get("buy_stack_open") or state.get("sell_stack_open"):
+        # Only warn if the flag is STALE (flagged open but no real positions)
+        real_positions = get_bot_positions()
+        has_buys  = any(p.type == BUY  for p in real_positions)
+        has_sells = any(p.type == SELL for p in real_positions)
+        if state.get("buy_stack_open") and not has_buys:
+            print(f"  ⚠️  buy_stack_open was stale — auto-clearing")
+            state["buy_stack_open"]      = False
+            state["buy_deep_level"]      = 0
+            state["buy_last_deep_price"] = None
+            save_state(state)
+        elif state.get("sell_stack_open") and not has_sells:
+            print(f"  ⚠️  sell_stack_open was stale — auto-clearing")
+            state["sell_stack_open"]      = False
+            state["sell_deep_level"]      = 0
+            state["sell_last_deep_price"] = None
+            save_state(state)
+        else:
+            # Stack genuinely open — silently wait (no spam)
+            return False
         return False
 
     ok, filter_reason = check_market_filters(ema_timeframe)
@@ -329,21 +355,22 @@ def open_greedy_stack(state, ema_timeframe):
         print(f"\n⏳ FILTER BLOCK | {filter_reason}")
         return False
 
-    # Determine which direction to open next based on alternation
-    # last_direction: 0=BUY, 1=SELL, None=first time
+    # Determine direction
     last = state.get("last_stack_direction")
 
     if last is None:
-        # First ever entry — use EMA direction
-        direction, _ = get_trend_direction()
+        print(f"  🔍 First entry — checking EMA direction...")
+        direction, ema_val = get_trend_direction()
         if direction is None:
+            print(f"  ⚠️  EMA returned None — cannot determine direction, skipping")
             return False
+        print(f"  ✅ EMA direction: {'BUY 📈' if direction == BUY else 'SELL 📉'}")
     else:
-        # Alternate: if last was BUY → open SELL, if last was SELL → open BUY
         direction = SELL if last == BUY else BUY
         dir_str   = "BUY 📈" if direction == BUY else "SELL 📉"
         print(f"\n🔄 ALTERNATING → {dir_str} (last was {'BUY' if last == BUY else 'SELL'})")
 
+    print(f"  🚀 Opening stack...")
     return _open_stack(state, direction, ema_timeframe)
 
 
