@@ -265,7 +265,10 @@ def _manage_stack(state, direction, positions):
     total_lots = sum(p.volume for p in positions)
 
     # ── FULL STACK FLIP ──────────────────────────────────────
-    if total_pnl >= threshold:
+    # Only close ALL if every position is out of the red (no deeply red ones)
+    red_positions = [p for p in positions if p.profit < 0]
+    all_clear     = len(red_positions) == 0
+    if total_pnl >= threshold and all_clear:
         print(f"\n💥 {dir_str} FULL FLIP | +${total_pnl:.2f} | "
               f"{len(positions)} positions | CLOSING ALL...")
         closed = close_positions_parallel(positions)
@@ -293,12 +296,16 @@ def _manage_stack(state, direction, positions):
     # ── DEEP LEVEL ───────────────────────────────────────────
     _try_deep_level(state, direction, positions)
 
-    # ── STATUS ───────────────────────────────────────────────
+    # ── STATUS (throttled — only print when P&L moves $1+) ──────
     symbol_info = mt5.symbol_info(CONFIG["symbol"])
     tick        = mt5.symbol_info_tick(CONFIG["symbol"])
     point       = symbol_info.point if symbol_info else 0.01
 
-    if total_lots > 0:
+    last_pnl_key = f"{dir_key}_last_logged_pnl"
+    last_pnl     = state.get(last_pnl_key)
+    should_log   = (last_pnl is None) or (abs(total_pnl - last_pnl) >= 1.0)
+
+    if should_log and total_lots > 0:
         weighted_entry = sum(p.price_open * p.volume for p in positions) / total_lots
         be_dist        = abs(weighted_entry - tick.bid) / point
         be_dir         = "needs ↑" if direction == BUY else "needs ↓"
@@ -306,6 +313,7 @@ def _manage_stack(state, direction, positions):
         print(f"\n{color} {dir_str} | P&L: ${total_pnl:.2f} | Lots: {total_lots:.2f} | "
               f"{len(positions)} pos (deep:{deep_level}/{max_deep}) | "
               f"BE: {weighted_entry:.2f} ({be_dist:.0f}pts {be_dir})")
+        state[last_pnl_key] = total_pnl
 
     return False
 
@@ -324,7 +332,25 @@ def open_greedy_stack(state, ema_timeframe):
 
     # Don't open if any stack is already open
     if state.get("buy_stack_open") or state.get("sell_stack_open"):
-        print(f"  ⏸️  Stack already open — waiting for close")
+        # Only warn if the flag is STALE (flagged open but no real positions)
+        real_positions = get_bot_positions()
+        has_buys  = any(p.type == BUY  for p in real_positions)
+        has_sells = any(p.type == SELL for p in real_positions)
+        if state.get("buy_stack_open") and not has_buys:
+            print(f"  ⚠️  buy_stack_open was stale — auto-clearing")
+            state["buy_stack_open"]      = False
+            state["buy_deep_level"]      = 0
+            state["buy_last_deep_price"] = None
+            save_state(state)
+        elif state.get("sell_stack_open") and not has_sells:
+            print(f"  ⚠️  sell_stack_open was stale — auto-clearing")
+            state["sell_stack_open"]      = False
+            state["sell_deep_level"]      = 0
+            state["sell_last_deep_price"] = None
+            save_state(state)
+        else:
+            # Stack genuinely open — silently wait (no spam)
+            return False
         return False
 
     ok, filter_reason = check_market_filters(ema_timeframe)

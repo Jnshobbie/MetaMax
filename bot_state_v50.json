@@ -1,17 +1,70 @@
 {
-  "bot_balance": 98.9,
-  "locked_capital": 50.0,
-  "total_trades": 19,
-  "total_wins": 4,
+  "bot_balance": 93.72,
+  "locked_capital": 50.32,
+  "total_trades": 220,
+  "total_wins": 55,
   "grid_level": 0,
   "last_grid_price": null,
   "direction": null,
   "manual_pause": false,
   "mode": "auto",
   "reload_pending": false,
-  "total_reloads": 0,
-  "reload_history": [],
-  "last_close_time": 1778615118.675341,
+  "total_reloads": 13,
+  "reload_history": [
+    {
+      "time": "09:49:43",
+      "amount": 10.0
+    },
+    {
+      "time": "09:49:59",
+      "amount": 10.0
+    },
+    {
+      "time": "09:52:10",
+      "amount": 10.0
+    },
+    {
+      "time": "09:52:19",
+      "amount": 10.0
+    },
+    {
+      "time": "09:52:31",
+      "amount": 10.0
+    },
+    {
+      "time": "09:52:41",
+      "amount": 25.0
+    },
+    {
+      "time": "14:14:07",
+      "amount": 10.0
+    },
+    {
+      "time": "14:16:19",
+      "amount": 10.0
+    },
+    {
+      "time": "14:16:34",
+      "amount": 10.0
+    },
+    {
+      "time": "19:53:50",
+      "amount": 20.0
+    },
+    {
+      "time": "19:53:59",
+      "amount": 100.0
+    },
+    {
+      "time": "19:59:40",
+      "amount": 50.0
+    },
+    {
+      "time": "20:12:30",
+      "amount": 20.0
+    }
+  ],
+  "last_close_time": 1780272851.6540806,
   "last_emergency_time": 0.0,
   "last_failed_direction": null,
   "cycle_entry_price": null,
@@ -19,10 +72,10 @@
   "compression_fired": false,
   "harvest_peak": 0.0,
   "harvest_peak_time": 0.0,
-  "buy_stack_open": false,
+  "buy_stack_open": true,
   "buy_deep_level": 0,
-  "buy_last_deep_price": null,
-  "buy_entry_price": null,
+  "buy_last_deep_price": 4540.16,
+  "buy_entry_price": 4540.16,
   "sell_stack_open": false,
   "sell_deep_level": 0,
   "sell_last_deep_price": null,
@@ -32,8 +85,8 @@
   "total_cuts": 0,
   "total_velocity_exits": 0,
   "total_scout_rejections": 0,
-  "total_greedy_wins": 4,
-  "total_greedy_flips": 3,
+  "total_greedy_wins": 55,
+  "total_greedy_flips": 14,
   "greedy_burst_open": false,
   "greedy_deep_level": 0,
   "greedy_last_deep_price": null
