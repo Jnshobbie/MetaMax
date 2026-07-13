@@ -1,184 +1,61 @@
 """
-XAUUSD Greedy Scalper Bot v5.0 — main.py
-─────────────────────────────────────────
-MODULES:
-  bot_config.py   — All CONFIG constants + phase names
-  bot_state.py    — State load/save/default
-  bot_mt5.py      — MT5 connect, orders, parallel close, EMA
-  bot_filters.py  — H1/range/slope market condition filters
-  bot_greedy.py   — "Greedy Scalper" core (stack + average + flip-close)
-  main.py         — Orchestration loop (this file)
-
-THE STRATEGY (v5.0 "Greedy Scalper"):
-  • OPEN:  Stack positions in EMA trend direction
-  • HOLD:  NEVER close while stack is red — add averaging positions
-           to pull break-even closer as price moves against us
-  • CLOSE: The MILLISECOND combined P&L > $0.10 (blue) → close ALL
-  • SAFE:  One hard stop — account equity drops 20% → kill all
-
-─────────────────────────────────────────
+XAUUSD Smart Scalper Bot — main.py
+────────────────────────────────────
+Strategy: Signal-first, clean entries, accept losses fast, recover 3x.
+EMA 9/21 = gate | RSI 14 + candle body = confirmation
+One trade at a time. Daily loss limit. No burst, no holding red.
 """
 
 import MetaTrader5 as mt5
-import threading
 import time
 import os
 from datetime import datetime
 
-from bot_config  import CONFIG, PHASE_GREEDY, STATE_FILE
-from bot_state   import load_state, save_state, default_state
+from bot_config  import CONFIG, PHASE_SMART, STATE_FILE
+from bot_state   import load_state, save_state
 from bot_mt5     import (
-    connect, detect_filling_mode, EMA_TIMEFRAME,
-    get_bot_positions, get_lot_for_balance, get_total_lots,
-    in_session, get_trend_direction, close_all_positions
+    connect, detect_filling_mode,
+    get_bot_positions, get_lot_for_balance,
+    in_session, close_all_positions
 )
-from bot_filters import get_filter_cache, invalidate_filter_cache
-from bot_greedy  import open_greedy_stack, check_greedy
-
-
-# ─────────────────────────────────────────
-#  CAPITAL LOCK
-# ─────────────────────────────────────────
-def check_capital_lock(state):
-    bot_bal = state["bot_balance"]
-    locked  = state["locked_capital"]
-    if bot_bal >= locked * CONFIG["lock_profit_at"]:
-        new_locked = bot_bal / 2
-        if new_locked > locked:
-            print(f"\n🔒 CAPITAL LOCK! Locking ${new_locked:.2f} | "
-                  f"Trading with ${bot_bal - new_locked:.2f}")
-            state["locked_capital"] = new_locked
-            state["bot_balance"]    = bot_bal - new_locked
-            save_state(state)
-
-
-# ─────────────────────────────────────────
-#  KILL SWITCH
-# ─────────────────────────────────────────
-def check_kill_switch(state):
-    positions = get_bot_positions()
-    floating  = sum(p.profit for p in positions)
-    threshold = -(state["bot_balance"] * CONFIG["kill_switch_ratio"])
-    if floating <= threshold:
-        print(f"\n💀 KILL SWITCH | Float: ${floating:.2f} | Threshold: ${threshold:.2f}")
-        close_all_positions()
-        state["manual_pause"]   = True
-        state["reload_pending"] = True
-        save_state(state)
-        return True
-    return False
-
-
-# ─────────────────────────────────────────
-#  RELOAD LISTENER
-# ─────────────────────────────────────────
-def reload_listener(state):
-    info      = mt5.account_info()
-    acct_bal  = info.balance
-    locked    = state["locked_capital"]
-    available = max(acct_bal - locked - state["bot_balance"], 0)
-
-    print(f"\n{'═'*55}")
-    print(f"  🚨 BOT CAPITAL DEPLETED — YOUR ACTION REQUIRED")
-    print(f"{'═'*55}")
-    print(f"  Account Balance:  ${acct_bal:.2f}")
-    print(f"  Locked (safe):    ${locked:.2f}")
-    print(f"  Available:        ${available:.2f}")
-    print(f"{'─'*55}")
-
-    while True:
-        try:
-            raw    = input("  💰 Reload amount ($, 0 = stop bot): ").strip()
-            amount = float(raw)
-            if amount < 0:
-                print("  ❌ Must be 0 or positive.")
-                continue
-            if amount == 0:
-                print("  🛑 Bot deactivated.")
-                os._exit(0)
-            if amount > available:
-                print(f"  ⚠️  Max available: ${available:.2f}")
-                continue
-            state["bot_balance"]    = amount
-            state["manual_pause"]   = False
-            state["reload_pending"] = False
-            state["total_reloads"] += 1
-            state["reload_history"].append({
-                "time":   datetime.now().strftime("%H:%M:%S"),
-                "amount": amount
-            })
-            save_state(state)
-            print(f"\n  ✅ Reloaded ${amount:.2f} — bot resuming!")
-            break
-        except (ValueError, KeyboardInterrupt):
-            os._exit(0)
+from bot_greedy  import open_greedy_stack, check_greedy, BUY
 
 
 # ─────────────────────────────────────────
 #  STATUS DISPLAY
 # ─────────────────────────────────────────
 def print_status(state):
-    import bot_mt5 as bmt5
-    ema_tf    = bmt5.EMA_TIMEFRAME
+    info      = mt5.account_info()
+    positions = get_bot_positions()
+    win_rate  = (state.get("total_wins", 0) / state.get("total_trades", 1) * 100) \
+                if state.get("total_trades", 0) > 0 else 0
 
-    info       = mt5.account_info()
-    positions  = get_bot_positions()
-    floating   = sum(p.profit for p in positions)
-    total_lots = get_total_lots(positions)
-    active, session_name = in_session()
-    win_rate   = (state["total_wins"] / state["total_trades"] * 100) \
-                 if state["total_trades"] > 0 else 0
-    dir_val    = state.get("direction")
-    dir_str    = "BUY 📈" if dir_val == 0 else ("SELL 📉" if dir_val == 1 else "—")
+    tick       = mt5.symbol_info_tick(CONFIG["symbol"])
+    price_str  = f"{tick.bid:.2f}" if tick else "N/A"
+    in_rec     = state.get("recovery_mode", False)
+    last_loss  = state.get("last_loss_amount", 0.0)
+    daily_lost = state.get("daily_loss_today", 0.0)
 
-    tick        = mt5.symbol_info_tick(CONFIG["symbol"])
-    server_time = datetime.fromtimestamp(tick.time).strftime("%H:%M:%S") if tick else "N/A"
+    pos_str = "No position — waiting for signal"
+    if positions:
+        p         = positions[0]
+        dir_label = "BUY 📈" if p.type == BUY else "SELL 📉"
+        pos_str   = (f"{dir_label} | Lot:{p.volume} | P&L:${p.profit:+.2f} | "
+                     f"TP:{p.tp:.2f} | SL:{p.sl:.2f}")
 
-    # Filter display — call it directly so status always reflects reality
-    from bot_filters import check_market_filters as _cmf
-    _f_ok, _f_reason = _cmf(ema_tf)
-    fc       = get_filter_cache()
-    h1_str   = ("📈" if fc["h1_trend"] == 0 else "📉") if fc["h1_trend"] is not None else "—"
-    m15_str  = ("📈" if fc["m15_trend"] == 0 else "📉") if fc["m15_trend"] is not None else "—"
-    body_str = f"{fc['avg_body']:.1f}pt" if fc["avg_body"] > 0 else "—"
-    if not CONFIG["h1_filter_enabled"] and not CONFIG["range_filter_enabled"] and not CONFIG["trend_strength_enabled"]:
-        fok_str = "✅ OFF (open)"
-    else:
-        fok_str = "✅ PASS" if _f_ok else "❌ BLOCKED"
-
-    max_deep  = CONFIG["greedy_deep_levels"]
-
-    # Per-stack info
-    buy_pos   = [p for p in positions if p.type == 0]
-    sell_pos  = [p for p in positions if p.type == 1]
-    buy_pnl   = sum(p.profit for p in buy_pos)
-    sell_pnl  = sum(p.profit for p in sell_pos)
-    buy_deep  = state.get("buy_deep_level", 0)
-    sell_deep = state.get("sell_deep_level", 0)
-
-    buy_str  = (f"{len(buy_pos)} pos | ${buy_pnl:+.2f} | deep:{buy_deep}/{max_deep}"
-                if buy_pos else "no stack")
-    sell_str = (f"{len(sell_pos)} pos | ${sell_pnl:+.2f} | deep:{sell_deep}/{max_deep}"
-                if sell_pos else "no stack")
+    mode_str = (f"🔁 RECOVERY (need +${last_loss * CONFIG['tp_recovery_multiplier']:.2f})"
+                if in_rec else "✅ NORMAL")
 
     print("\n" + "═"*57)
-    print(f"  🎲 XAUUSD DUAL GREEDY v5.0 | {datetime.now().strftime('%H:%M:%S')} | {server_time}")
+    print(f"  🧠 XAUUSD SMART SCALPER | {datetime.now().strftime('%H:%M:%S')}")
     print("═"*57)
-    print(f"  Account:   ${info.balance:.2f}  |  Equity: ${info.equity:.2f}")
-    print(f"  Bot Cap:   ${state['bot_balance']:.2f}  |  Floating: ${floating:+.2f}")
-    print(f"  🔒 Locked: ${state['locked_capital']:.2f}")
-    print(f"  📈 BUY:    {buy_str}")
-    print(f"  📉 SELL:   {sell_str}")
-    print(f"  Total:     {len(positions)} positions | {total_lots:.2f} lots")
-    print(f"  Close at:  +${CONFIG['greedy_close_threshold']:.2f} | "
-          f"Burst: {CONFIG['greedy_burst_levels']} | Deep: every {CONFIG['greedy_deep_step']}pts")
-    print(f"  Emergency: equity drops {CONFIG['greedy_account_stop_pct']*100:.0f}% → kill all")
-    print(f"  Filters:   {fok_str} | H1:{h1_str} M15:{m15_str} | Body:{body_str}")
-    print(f"  Trades:    {state['total_trades']} | Wins: {state['total_wins']} | WR: {win_rate:.1f}%")
-    print(f"  Greedy:    Wins: {state.get('total_greedy_wins',0)} | "
-          f"Flips: {state.get('total_greedy_flips',0)}")
-    print(f"  Session:   {'✅ ' + session_name if active else '⏸️  No session'} | "
-          f"Mode: {CONFIG['trading_mode'].upper()}")
+    print(f"  Account:  ${info.balance:.2f} | Equity: ${info.equity:.2f}")
+    print(f"  Price:    {price_str}")
+    print(f"  Mode:     {mode_str}")
+    print(f"  Position: {pos_str}")
+    print(f"  Daily:    Lost ${daily_lost:.2f} / limit ${CONFIG['daily_loss_limit']:.2f}")
+    print(f"  Stats:    {state.get('total_trades',0)} trades | "
+          f"{state.get('total_wins',0)} wins | WR:{win_rate:.1f}%")
     print("═"*57)
 
 
@@ -196,29 +73,34 @@ def bot_loop():
         return
 
     ema_tf = bmt5.EMA_TIMEFRAME
+    state  = load_state()
 
-    state = load_state()
-    state["phase"] = PHASE_GREEDY
+    # Ensure all required state fields exist
+    state["phase"]            = PHASE_SMART
+    state["position_open"]    = state.get("position_open", False)
+    state["position_ticket"]  = state.get("position_ticket", None)
+    state["recovery_mode"]    = state.get("recovery_mode", False)
+    state["last_loss_amount"] = state.get("last_loss_amount", 0.0)
+    state["daily_loss_today"] = state.get("daily_loss_today", 0.0)
+    state["daily_loss_date"]  = state.get("daily_loss_date", "")
+    state["total_trades"]     = 0
+    state["total_wins"]       = 0
     save_state(state)
 
-    # Clear any orphan positions on startup
+    # Clear orphan position flags if no open positions found
     if not get_bot_positions():
-        state["direction"]        = None
-        state["greedy_burst_open"] = False
-        state["greedy_deep_level"] = 0
-        state["greedy_last_deep_price"] = None
+        state["position_open"]   = False
+        state["position_ticket"] = None
         save_state(state)
 
-    print(f"\n🎲 XAUUSD Greedy Scalper Bot v5.0")
-    print(f"   Mode:         GREEDY — stack & never close in red")
-    print(f"   Close trigger: +${CONFIG['greedy_close_threshold']:.2f} combined (any blue = CLOSE ALL)")
-    print(f"   Burst:        {CONFIG['greedy_burst_levels']} positions simultaneously | lot ×{CONFIG['greedy_avg_multiplier']}")
-    print(f"   Deep levels:  every {CONFIG['greedy_deep_step']}pts | max {CONFIG['greedy_deep_levels']} extra levels")
-    print(f"   Emergency:    equity drops {CONFIG['greedy_account_stop_pct']*100:.0f}% → kill all")
-    print(f"   Filters:      H1 {'ON' if CONFIG['h1_filter_enabled'] else 'OFF'} | "
-          f"Range {'ON' if CONFIG['range_filter_enabled'] else 'OFF'} | "
-          f"Slope {'ON' if CONFIG['trend_strength_enabled'] else 'OFF'}")
-    print(f"   ℹ️  '❌ RETURN failed' on startup is NORMAL.\n")
+    print(f"\n🧠 XAUUSD Smart Scalper — Small Account Mode")
+    print(f"   Signals:     EMA {CONFIG['ema_fast']}/{CONFIG['ema_slow']} (gate) + RSI {CONFIG['rsi_period']} + Candle confirm")
+    print(f"   Entry:       1 position | Wait for M1 candle close")
+    print(f"   TP / SL:     {CONFIG['tp_normal_points']}pts / {CONFIG['sl_points']}pts")
+    print(f"   Recovery:    3x last loss TP after any SL hit")
+    print(f"   Daily limit: Stop if down ${CONFIG['daily_loss_limit']:.2f}/day")
+    print(f"   Emergency:   Equity drops {CONFIG['greedy_account_stop_pct']*100:.0f}% → kill all")
+    print(f"   Lot:         {CONFIG.get('force_lot') or 'auto'} (cap {CONFIG['lot_hard_cap']})\n")
 
     last_status    = 0
     last_heartbeat = 0
@@ -227,36 +109,28 @@ def bot_loop():
         try:
             state = load_state()
 
-            if state.get("reload_pending"):
-                t = threading.Thread(target=reload_listener, args=(state,), daemon=True)
-                t.start()
-                t.join()
-                state = load_state()
-                continue
-
-            if state["manual_pause"]:
+            if state.get("manual_pause"):
                 time.sleep(0.5)
                 continue
 
             active, session_name = in_session()
             now = time.time()
 
-            # ── Heartbeat ──────────────────────────────
+            # ── Heartbeat ──────────────────────────────────────
             if now - last_heartbeat >= CONFIG["heartbeat_interval"]:
                 positions = get_bot_positions()
-                floating  = sum(p.profit for p in positions) if positions else 0
                 tick      = mt5.symbol_info_tick(CONFIG["symbol"])
-                deep_lvl  = state.get("greedy_deep_level", 0)
+                in_rec    = state.get("recovery_mode", False)
 
                 if not active:
-                    hb = f"⏸️  Waiting for session..."
+                    hb = "⏸️  Outside session"
                 elif positions:
-                    hb = (f"🎲 {len(positions)} pos | Red: ${floating:.2f} | "
-                          f"Deep: {deep_lvl}/{CONFIG['greedy_deep_levels']}")
+                    p  = positions[0]
+                    hb = (f"{'BUY 📈' if p.type == 0 else 'SELL 📉'} | "
+                          f"P&L: ${p.profit:+.2f} | TP: {p.tp:.2f} | SL: {p.sl:.2f}")
                 else:
-                    all_off = not CONFIG["h1_filter_enabled"] and not CONFIG["range_filter_enabled"] and not CONFIG["trend_strength_enabled"]
-                    fok = "✅ OFF" if all_off else ("✅" if get_filter_cache()["result"] else "❌")
-                    hb  = f"🔍 {tick.bid:.2f} | Filters:{fok} | No positions"
+                    tag = "🔁 RECOVERY" if in_rec else "✅ NORMAL"
+                    hb  = f"🔍 {tick.bid:.2f} | {tag} | Waiting for signal..."
 
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] {hb}")
                 last_heartbeat = now
@@ -265,27 +139,17 @@ def bot_loop():
                 time.sleep(5)
                 continue
 
-            # ── Status print ───────────────────────────
+            # ── Status print ───────────────────────────────────
             if now - last_status >= CONFIG["status_interval"]:
                 print_status(state)
                 last_status = now
 
-            # ── Safety checks ──────────────────────────
-            if check_kill_switch(state):
-                state = load_state()
-                continue
-
-            check_capital_lock(state)
-            state = load_state()
-
-            # ── SINGLE STACK ALTERNATING CORE ────────
+            # ── Core logic ─────────────────────────────────────
             positions = get_bot_positions()
 
-            if positions:
-                # Stack is open — manage it
+            if positions or state.get("position_open"):
                 check_greedy(state, ema_tf)
             else:
-                # No stack open — open next one (alternates BUY→SELL→BUY)
                 open_greedy_stack(state, ema_tf)
 
             time.sleep(CONFIG["poll_interval"])

@@ -24,7 +24,7 @@ def connect():
     ):
         print(f"❌ MT5 connect failed: {mt5.last_error()}")
         return False
-    EMA_TIMEFRAME = mt5.TIMEFRAME_M15
+    EMA_TIMEFRAME = mt5.TIMEFRAME_M1   # Smart scalper runs on M1
     info = mt5.account_info()
     print(f"✅ Connected | Balance: ${info.balance:.2f} | Equity: ${info.equity:.2f}")
     server_time = datetime.fromtimestamp(mt5.symbol_info_tick(CONFIG["symbol"]).time)
@@ -38,6 +38,18 @@ def connect():
 # ─────────────────────────────────────────
 def detect_filling_mode():
     global FILLING_MODE
+    override = CONFIG.get("filling_mode_override")
+    if override:
+        mode_map = {
+            "RETURN": mt5.ORDER_FILLING_RETURN,
+            "IOC":    mt5.ORDER_FILLING_IOC,
+            "FOK":    mt5.ORDER_FILLING_FOK,
+        }
+        if override in mode_map:
+            FILLING_MODE = mode_map[override]
+            print(f"\n🔍 Filling mode: {override} (skipping test trade)")
+            return True
+
     symbol_info = mt5.symbol_info(CONFIG["symbol"])
     if not symbol_info:
         print("❌ Cannot detect filling mode — symbol not found")
@@ -104,41 +116,29 @@ def get_bot_positions():
 
 
 def get_lot_for_balance(balance):
+    """Get lot size. force_lot in config overrides everything."""
+    if CONFIG.get("force_lot") is not None:
+        return CONFIG["force_lot"]
     lot = CONFIG["lot_phases"][0]["lot"]
     for phase in reversed(CONFIG["lot_phases"]):
         if balance >= phase["min_balance"]:
             lot = phase["lot"]
             break
-    return lot
-
-
-def get_martingale_lot(base_lot, level):
-    return round(min(base_lot * (CONFIG["martingale_multiplier"] ** level), 100.0), 2)
-
-
-def get_greedy_avg_lot(base_lot, avg_level):
-    """Each averaging-down lot = base × multiplier^level (gentler growth)."""
-    return round(min(base_lot * (CONFIG["greedy_avg_multiplier"] ** avg_level), 100.0), 2)
-
-
-def get_tp_points(grid_level):
-    return CONFIG["take_profit_l4_points"] if grid_level >= 4 else CONFIG["take_profit_points"]
+    return min(lot, CONFIG["lot_hard_cap"])
 
 
 def get_total_lots(positions):
     return round(sum(p.volume for p in positions), 2)
 
 
-def get_trail_pct(peak_profit):
-    for tier in CONFIG["harvest_trail_tiers"]:
-        if peak_profit > tier["peak_above"]:
-            return tier["trail_pct"]
-    return CONFIG["harvest_trail_tiers"][-1]["trail_pct"]
-
-
-def place_order(order_type, lot, comment="bot", grid_level=0):
+def place_order(order_type, lot, comment="bot", sl=None, tp=None):
+    """
+    Place a single market order with optional TP and SL.
+    Uses the detected filling mode.
+    """
     global FILLING_MODE
     if FILLING_MODE is None:
+        print("  ❌ place_order: no filling mode detected yet")
         return None
 
     symbol_info = mt5.symbol_info(CONFIG["symbol"])
@@ -147,16 +147,8 @@ def place_order(order_type, lot, comment="bot", grid_level=0):
     if not symbol_info.visible:
         mt5.symbol_select(CONFIG["symbol"], True)
 
-    tick   = mt5.symbol_info_tick(CONFIG["symbol"])
-    point  = symbol_info.point
-    tp_pts = get_tp_points(grid_level)
-
-    if order_type == mt5.ORDER_TYPE_BUY:
-        price = tick.ask
-        tp    = round(price + tp_pts * point, 2)
-    else:
-        price = tick.bid
-        tp    = round(price - tp_pts * point, 2)
+    tick  = mt5.symbol_info_tick(CONFIG["symbol"])
+    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -164,18 +156,23 @@ def place_order(order_type, lot, comment="bot", grid_level=0):
         "volume":       lot,
         "type":         order_type,
         "price":        price,
-        "tp":           tp,
         "deviation":    50,
         "magic":        CONFIG["magic"],
         "comment":      comment,
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": FILLING_MODE,
     }
+    if tp is not None:
+        request["tp"] = tp
+    if sl is not None:
+        request["sl"] = sl
 
     result = mt5.order_send(request)
     if result and result.retcode == mt5.TRADE_RETCODE_DONE:
         dir_str = "BUY " if order_type == mt5.ORDER_TYPE_BUY else "SELL"
-        print(f"  ✅ {dir_str} {lot} lots @ {price:.2f} | TP: {tp:.2f} ({tp_pts}pts)")
+        print(f"  ✅ {dir_str} {lot} lots @ {price:.2f}"
+              + (f" | TP: {tp:.2f}" if tp else "")
+              + (f" | SL: {sl:.2f}" if sl else ""))
         return result
     else:
         code = result.retcode if result else mt5.last_error()
@@ -259,26 +256,13 @@ def in_session():
 
 
 # ─────────────────────────────────────────
-#  EMA / TREND
+#  TREND (legacy shim — new signals in bot_filters.py)
 # ─────────────────────────────────────────
 def get_trend_direction():
-    global EMA_TIMEFRAME
-    period = CONFIG["ema_period"]
-    rates  = mt5.copy_rates_from_pos(CONFIG["symbol"], EMA_TIMEFRAME, 0, period + 10)
-
-    if rates is None or len(rates) < period:
-        tick = mt5.symbol_info_tick(CONFIG["symbol"])
-        print(f"  ⚠️  EMA data unavailable — defaulting to SELL (price: {tick.bid:.2f})")
+    """Legacy shim kept for import compat. Real signals now in bot_filters.get_signal()."""
+    rates = mt5.copy_rates_from_pos(CONFIG["symbol"], mt5.TIMEFRAME_M1, 0, 30)
+    if rates is None or len(rates) < 2:
         return mt5.ORDER_TYPE_SELL, None
-
-    closes = [r["close"] for r in rates]
-    ema    = closes[0]
-    k      = 2 / (period + 1)
-    for price in closes[1:]:
-        ema = price * k + ema * (1 - k)
-
-    current = closes[-1]
-    trend   = mt5.ORDER_TYPE_BUY if current > ema else mt5.ORDER_TYPE_SELL
-    label   = "📈 UPTREND" if trend == mt5.ORDER_TYPE_BUY else "📉 DOWNTREND"
-    print(f"  📊 EMA50: {ema:.2f} | Price: {current:.2f} | {label}")
-    return trend, ema
+    closes  = [r["close"] for r in rates]
+    trend   = mt5.ORDER_TYPE_BUY if closes[-1] > closes[-2] else mt5.ORDER_TYPE_SELL
+    return trend, closes[-1]

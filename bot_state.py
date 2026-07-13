@@ -1,60 +1,38 @@
 """
-bot_state.py — State persistence for XAUUSD Greedy Scalper Bot
+bot_state.py — State persistence for XAUUSD Smart Scalper
 """
 
 import json
 import os
-from bot_config import CONFIG, STATE_FILE, PHASE_GREEDY
+from bot_config import STATE_FILE, PHASE_SMART
 
 
 def default_state():
     return {
-        "bot_balance":          CONFIG["starting_capital"],
-        "locked_capital":       CONFIG["starting_capital"],
-        "total_trades":         0,
-        "total_wins":           0,
-        "grid_level":           0,
-        "last_grid_price":      None,
-        "direction":            None,
+        # ── Core ────────────────────────────────
+        "phase":                PHASE_SMART,
         "manual_pause":         False,
         "mode":                 "auto",
-        "reload_pending":       False,
-        "total_reloads":        0,
-        "reload_history":       [],
+
+        # ── Active trade ────────────────────────
+        "position_open":        False,
+        "position_ticket":      None,
+        "position_tickets":     [],
+        "last_entry_time":      0.0,
         "last_close_time":      0.0,
         "last_emergency_time":  0.0,
-        "last_failed_direction":None,
-        "cycle_entry_price":    None,
 
-        # Phase
-        "phase":                PHASE_GREEDY,
-        "compression_fired":    False,
-        "harvest_peak":         0.0,
-        "harvest_peak_time":    0.0,
+        # ── Recovery mode ───────────────────────
+        "recovery_mode":        False,
+        "last_loss_amount":     0.0,
 
-        # ── BUY stack state ──────────────────────
-        "buy_stack_open":       False,
-        "buy_deep_level":       0,
-        "buy_last_deep_price":  None,
-        "buy_entry_price":      None,
+        # ── Daily loss tracker ──────────────────
+        "daily_loss_today":     0.0,
+        "daily_loss_date":      "",
 
-        # ── SELL stack state ─────────────────────
-        "sell_stack_open":      False,
-        "sell_deep_level":      0,
-        "sell_last_deep_price": None,
-        "sell_entry_price":     None,
-
-        # ── Alternation tracker ──────────────────
-        # None = first entry (use EMA), 0 = last was BUY, 1 = last was SELL
-        "last_stack_direction": None,
-
-        # Stats
-        "total_harvests":         0,
-        "total_cuts":             0,
-        "total_velocity_exits":   0,
-        "total_scout_rejections": 0,
-        "total_greedy_wins":      0,
-        "total_greedy_flips":     0,
+        # ── Stats ───────────────────────────────
+        "total_trades":         0,
+        "total_wins":           0,
     }
 
 
@@ -62,6 +40,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             s = json.load(f)
+        # Add any missing keys from default (safe upgrades)
         for k, v in default_state().items():
             if k not in s:
                 s[k] = v

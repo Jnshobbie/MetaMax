@@ -1,430 +1,380 @@
 """
-bot_greedy.py — Dual Direction Greedy Scalper
-──────────────────────────────────────────────
-DUAL DIRECTION: Bot runs TWO independent stacks simultaneously.
-  - BUY stack:  6 positions fired when M15 EMA says uptrend
-  - SELL stack: 6 positions fired when M15 EMA says downtrend
-  Both stacks are managed independently. A BUY stack bleeding red
-  while a SELL stack is printing blue is NORMAL — the SELL snipes
-  its profits immediately, offsetting the BUY drawdown.
+bot_greedy.py — Smart Small Account Scalper
+─────────────────────────────────────────────
+STRATEGY:
+  1. Wait for new M1 candle to close
+  2. EMA 9/21 sets direction (gate) — RSI + candle body must confirm
+  3. Enter 1 position with TP + SL
+  4. TP hit → bank profit, back to normal
+  5. SL hit → log loss, enter recovery mode
+  6. Recovery: next signal → enter with TP = 3x last loss amount
+  7. Recovery TP hit → clear loss memory, back to normal
 
-ENTRY LOGIC (per stack):
-  - Check EMA direction for that stack's side
-  - If no stack of that direction exists → fire 6 burst simultaneously
-  - Never open a second BUY stack while one BUY stack is already open
-  - Never open a second SELL stack while one SELL stack is already open
-
-CLOSE LOGIC (per stack, independent):
-  A) Any individual position in stack turns blue → snipe immediately
-  B) Combined stack P&L >= $0.10 → close entire stack
-  C) Account equity drops 20% → kill ALL positions both stacks
-
-DEEP LEVELS: Each stack independently adds deep levels every 200pts
-──────────────────────────────────────────────
+NO burst. NO deep levels. NO holding red. One clean trade at a time.
+─────────────────────────────────────────────
 """
 
 import MetaTrader5 as mt5
-import threading
 import time
-from bot_config import CONFIG, PHASE_GREEDY
+from datetime import datetime
+
+from bot_config import CONFIG, PHASE_SMART, PHASE_GREEDY
 from bot_state  import save_state
 from bot_mt5    import (
-    get_bot_positions, get_lot_for_balance, get_greedy_avg_lot,
-    place_order, close_positions_parallel, get_trend_direction,
+    get_bot_positions, get_lot_for_balance,
+    close_positions_parallel, FILLING_MODE,
 )
-from bot_filters import check_market_filters, invalidate_filter_cache
+from bot_filters import get_signal, is_new_candle, invalidate_filter_cache
 
 BUY  = mt5.ORDER_TYPE_BUY   # 0
 SELL = mt5.ORDER_TYPE_SELL  # 1
 
-
-# ─────────────────────────────────────────
-#  HELPERS — split positions by direction
-# ─────────────────────────────────────────
-def _buy_positions(positions):
-    return [p for p in positions if p.type == BUY]
-
-def _sell_positions(positions):
-    return [p for p in positions if p.type == SELL]
-
-
-# ─────────────────────────────────────────
-#  ENTRY COOLDOWN (per direction)
-# ─────────────────────────────────────────
-def _can_enter(state):
-    now        = time.time()
-    elapsed    = now - state.get("last_close_time", 0)
-    if elapsed < CONFIG["reentry_cooldown"]:
-        return False, f"Cooldown: {CONFIG['reentry_cooldown'] - elapsed:.1f}s"
-
-    last_emerg = state.get("last_emergency_time", 0)
-    if last_emerg > 0:
-        since = now - last_emerg
-        if since < CONFIG["emergency_cooldown"]:
-            return False, f"Post-emergency: {CONFIG['emergency_cooldown'] - since:.0f}s"
-
-    return True, ""
+_last_entry_candle = 0
 
 
 # ─────────────────────────────────────────
 #  ACCOUNT EMERGENCY STOP
 # ─────────────────────────────────────────
 def _account_emergency(state):
-    info      = mt5.account_info()
+    info = mt5.account_info()
+    if info is None:
+        return False
     equity    = info.equity
     balance   = info.balance
-    drop_pct  = CONFIG["greedy_account_stop_pct"]
-    threshold = balance * (1.0 - drop_pct)
+    threshold = balance * (1.0 - CONFIG["greedy_account_stop_pct"])
 
     if equity <= threshold:
-        print(f"\n🚨🚨 ACCOUNT EMERGENCY STOP 🚨🚨")
-        print(f"   Equity: ${equity:.2f} | Threshold: ${threshold:.2f} ({drop_pct*100:.0f}% drop)")
+        print(f"\n🚨 EMERGENCY STOP | Equity: ${equity:.2f} < ${threshold:.2f}")
         positions = get_bot_positions()
-        closed    = close_positions_parallel(positions)
-        total_pnl = sum(p.profit for p in positions)
-        print(f"   Closed {closed} positions (both stacks) | P&L: ${total_pnl:.2f}")
-
-        now = time.time()
-        state["last_emergency_time"]    = now
-        state["last_close_time"]        = now
-        state["buy_stack_open"]         = False
-        state["buy_deep_level"]         = 0
-        state["buy_last_deep_price"]    = None
-        state["sell_stack_open"]        = False
-        state["sell_deep_level"]        = 0
-        state["sell_last_deep_price"]   = None
-        state["direction"]              = None
-        state["phase"]                  = PHASE_GREEDY
-        invalidate_filter_cache()
+        if positions:
+            close_positions_parallel(positions)
+        state["last_emergency_time"] = time.time()
+        state["position_open"]       = False
+        state["position_ticket"]     = None
         save_state(state)
         return True
     return False
 
 
 # ─────────────────────────────────────────
-#  RESET ONE STACK
+#  DAILY LOSS CHECK
 # ─────────────────────────────────────────
-def _reset_stack(state, direction, pnl=0.0):
-    """Reset state for one direction (BUY or SELL) after its stack closes."""
-    if pnl > 0:
-        state["bot_balance"]       += pnl
-        state["total_wins"]        += 1
-        state["total_greedy_wins"] += 1
+def _check_daily_limit(state):
+    today = datetime.now().strftime("%Y-%m-%d")
+    if state.get("daily_loss_date") != today:
+        state["daily_loss_date"]  = today
+        state["daily_loss_today"] = 0.0
+        save_state(state)
+
+    limit = CONFIG["daily_loss_limit"]
+    lost  = state.get("daily_loss_today", 0.0)
+    if lost >= limit:
+        print(f"  📵 Daily loss limit hit: -${lost:.2f} / -${limit:.2f} — pausing until tomorrow")
+        return True
+    return False
+
+
+# ─────────────────────────────────────────
+#  PLACE ONE TRADE WITH TP + SL
+# ─────────────────────────────────────────
+def _place_smart_trade(state, direction):
+    """
+    Opens 1 position with calculated TP and SL.
+    Uses the globally detected FILLING_MODE — no hardcoded IOC.
+    """
+    import bot_mt5 as bmt5
+
+    filling = bmt5.FILLING_MODE
+    if filling is None:
+        print("  ❌ No filling mode detected — cannot place order")
+        return False
+
+    symbol  = CONFIG["symbol"]
+    info    = mt5.symbol_info(symbol)
+    tick    = mt5.symbol_info_tick(symbol)
+    point   = info.point
+    balance = mt5.account_info().balance
+    lot     = min(get_lot_for_balance(balance), CONFIG["lot_hard_cap"])
+
+    in_recovery = state.get("recovery_mode", False)
+    last_loss   = state.get("last_loss_amount", 0.0)
+    sl_pts      = CONFIG["sl_points"]
+    tp_pts      = CONFIG["tp_normal_points"]
+
+    # Recovery TP: calculate points needed to make 3x last loss
+    # XAUUSD: profit = lot * volume_step_ratio * pts * point
+    # Simpler: profit_per_pt ≈ lot * 10 (for XAUUSD where 1pt = $0.01 at 0.01 lot)
+    if in_recovery and last_loss > 0:
+        target_profit   = last_loss * CONFIG["tp_recovery_multiplier"]
+        # 1 point on XAUUSD = lot * 1.0 dollars (at standard lot = 100oz)
+        # At 0.01 lot: 1 point ($0.01 price move) = $0.01 profit
+        # So pts_needed = target / (lot * point_value_per_lot)
+        # point_value_per_lot for XAUUSD = contract_size * point = 100 * 0.01 = 1.0
+        contract_size   = info.trade_contract_size  # typically 100 for XAUUSD
+        profit_per_pt   = lot * contract_size * point
+        if profit_per_pt > 0:
+            tp_pts = max(int(target_profit / profit_per_pt), tp_pts)
+        print(f"  🎯 RECOVERY | Last loss: -${last_loss:.2f} | "
+              f"Target: +${target_profit:.2f} | TP: {tp_pts}pts")
 
     if direction == BUY:
-        state["buy_stack_open"]      = False
-        state["buy_deep_level"]      = 0
-        state["buy_last_deep_price"] = None
-        state["buy_entry_price"]     = None
+        price = tick.ask
+        tp    = round(price + tp_pts * point, info.digits)
+        sl    = round(price - sl_pts * point, info.digits)
     else:
-        state["sell_stack_open"]      = False
-        state["sell_deep_level"]      = 0
-        state["sell_last_deep_price"] = None
-        state["sell_entry_price"]     = None
+        price = tick.bid
+        tp    = round(price - tp_pts * point, info.digits)
+        sl    = round(price + sl_pts * point, info.digits)
 
-    # Only update close time if BOTH stacks are now closed
-    all_positions = get_bot_positions()
-    remaining_dir = [p for p in all_positions
-                     if p.type == direction]
-    if not remaining_dir:
-        state["last_close_time"] = time.time()
+    # ── Drift check — skip if price already moved against signal ──
+    drift_limit = CONFIG.get("entry_drift_limit_pts", 300)
+    rates = mt5.copy_rates_from_pos(CONFIG["symbol"], mt5.TIMEFRAME_M1, 1, 1)
+    if rates is not None and len(rates) > 0:
+        candle_close = rates[0]["close"]
+        drift = (price - candle_close) / point if direction == BUY else (candle_close - price) / point
+        if drift > drift_limit:
+            print(f"  ⏭️  Drift check: price moved {drift:.0f}pts against signal since candle close — skip")
+            return False
 
-    invalidate_filter_cache()
-    save_state(state)
+    dir_str = "BUY 📈" if direction == BUY else "SELL 📉"
+    print(f"\n🎯 {dir_str} | Lot: {lot} | Entry: {price:.2f} | "
+          f"TP: {tp:.2f} (+{tp_pts}pts) | SL: {sl:.2f} (-{sl_pts}pts)")
 
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       symbol,
+        "volume":       lot,
+        "type":         direction,
+        "price":        price,
+        "tp":           tp,
+        "sl":           sl,
+        "deviation":    50,
+        "magic":        CONFIG["magic"],
+        "comment":      "smart_recovery" if in_recovery else "smart_normal",
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": filling,
+    }
 
-# ─────────────────────────────────────────
-#  SIMULTANEOUS BURST ENGINE
-# ─────────────────────────────────────────
-def _fire_burst_simultaneously(direction, base_lot, n_levels, label):
-    results = [None] * n_levels
-    threads = []
-
-    def _open_one(idx):
-        lot    = get_greedy_avg_lot(base_lot, idx)
-        result = place_order(direction, lot, f"{label}_B{idx+1}", grid_level=0)
-        results[idx] = result
-
-    for i in range(n_levels):
-        t = threading.Thread(target=_open_one, args=(i,), daemon=True)
-        threads.append(t)
-
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=5.0)
-
-    return sum(1 for r in results if r is not None)
-
-
-# ─────────────────────────────────────────
-#  OPEN A STACK (BUY or SELL)
-# ─────────────────────────────────────────
-def _open_stack(state, direction, ema_timeframe):
-    """Open a burst stack for one direction if not already open."""
-    dir_key   = "buy" if direction == BUY else "sell"
-    stack_key = f"{dir_key}_stack_open"
-
-    if state.get(stack_key):
-        print(f"  ⏸️  {dir_key.upper()} stack already flagged open in state")
-        return False
-
-    current_positions = len(get_bot_positions())
-    if current_positions >= CONFIG["max_open_positions"]:
-        print(f"  ⚠️  Max positions reached ({current_positions}/{CONFIG['max_open_positions']})")
-        return False
-
-    bot_bal  = state["bot_balance"]
-    base_lot = get_lot_for_balance(bot_bal)
-    n_burst  = CONFIG["greedy_burst_levels"]
-    dir_str  = "BUY 📈" if direction == BUY else "SELL 📉"
-    label    = "buy" if direction == BUY else "sell"
-
-    print(f"  💰 Bot balance: ${bot_bal:.2f} | Base lot: {base_lot}")
-    lot_preview = [round(get_greedy_avg_lot(base_lot, i), 2) for i in range(n_burst)]
-    print(f"\n🚀 {dir_str} BURST | Firing {n_burst} positions SIMULTANEOUSLY")
-    print(f"   Lots: {lot_preview}")
-
-    opened = _fire_burst_simultaneously(direction, base_lot, n_burst, label)
-    print(f"   ✅ Opened {opened}/{n_burst} {dir_str} positions")
-
-    if opened > 0:
-        tick = mt5.symbol_info_tick(CONFIG["symbol"])
-        state[stack_key]                    = True
-        state[f"{dir_key}_deep_level"]      = 0
-        state[f"{dir_key}_last_deep_price"] = tick.bid
-        state[f"{dir_key}_entry_price"]     = tick.bid
-        state["last_stack_direction"]       = int(direction)
-        state["total_trades"]              += opened
-        save_state(state)
-        return True
-    print(f"  ❌ All {n_burst} orders failed — check MT5 connection")
-    return False
-
-
-# ─────────────────────────────────────────
-#  DEEP LEVEL ENGINE (per stack)
-# ─────────────────────────────────────────
-def _try_deep_level(state, direction, positions):
-    dir_key    = "buy" if direction == BUY else "sell"
-    deep_level = state.get(f"{dir_key}_deep_level", 0)
-    max_deep   = CONFIG["greedy_deep_levels"]
-
-    if deep_level >= max_deep:
-        return
-    if len(get_bot_positions()) >= CONFIG["max_open_positions"]:
-        return
-
-    symbol_info = mt5.symbol_info(CONFIG["symbol"])
-    tick        = mt5.symbol_info_tick(CONFIG["symbol"])
-    point       = symbol_info.point
-    step_pts    = CONFIG["greedy_deep_step"]
-    last_price  = state.get(f"{dir_key}_last_deep_price") or tick.bid
-
-    current_price = tick.bid if direction == BUY else tick.ask
-    moved_pts     = (last_price - current_price) / point if direction == BUY \
-                    else (current_price - last_price) / point
-
-    if moved_pts >= step_pts:
-        bot_bal   = state["bot_balance"]
-        base_lot  = get_lot_for_balance(bot_bal)
-        deep_lot  = get_greedy_avg_lot(base_lot, CONFIG["greedy_burst_levels"] + deep_level)
-        dir_str   = "BUY 📈" if direction == BUY else "SELL 📉"
-        level_num = CONFIG["greedy_burst_levels"] + deep_level + 1
-
-        print(f"\n📉 DEEP {dir_str} L{level_num} | {deep_lot} lots | "
-              f"{moved_pts:.0f}pts moved | Dragging BE closer...")
-
-        result = place_order(direction, deep_lot, f"{dir_key}_D{level_num}", grid_level=0)
-        if result:
-            state[f"{dir_key}_deep_level"]      = deep_level + 1
-            state[f"{dir_key}_last_deep_price"] = current_price
-            state["total_trades"]              += 1
-            save_state(state)
-
-
-# ─────────────────────────────────────────
-#  MANAGE ONE STACK
-# ─────────────────────────────────────────
-def _manage_stack(state, direction, positions):
-    """
-    Full lifecycle management for one direction's stack.
-    Returns True if action was taken (close/snipe).
-    """
-    if not positions:
-        return False
-
-    dir_key    = "buy" if direction == BUY else "sell"
-    dir_str    = "BUY 📈" if direction == BUY else "SELL 📉"
-    threshold  = CONFIG["greedy_close_threshold"]
-    burst_lvls = CONFIG["greedy_burst_levels"]
-    deep_level = state.get(f"{dir_key}_deep_level", 0)
-    max_deep   = CONFIG["greedy_deep_levels"]
-
-    total_pnl  = sum(p.profit for p in positions)
-    total_lots = sum(p.volume for p in positions)
-
-    # ── FULL STACK FLIP ──────────────────────────────────────
-    # Only close ALL if every position is out of the red (no deeply red ones)
-    red_positions = [p for p in positions if p.profit < 0]
-    all_clear     = len(red_positions) == 0
-    if total_pnl >= threshold and all_clear:
-        print(f"\n💥 {dir_str} FULL FLIP | +${total_pnl:.2f} | "
-              f"{len(positions)} positions | CLOSING ALL...")
-        closed = close_positions_parallel(positions)
-        print(f"   ✅ Closed {closed} | Banked: +${total_pnl:.2f}")
-        state["total_greedy_flips"] += 1
-        _reset_stack(state, direction, pnl=total_pnl)
-        return True
-
-    # ── INDIVIDUAL BLUE SNIPER ───────────────────────────────
-    blue = [p for p in positions if p.profit >= threshold]
-    if blue:
-        blue_pnl = sum(p.profit for p in blue)
-        print(f"\n💰 {dir_str} SNIPE | {len(blue)} blue | "
-              f"+${blue_pnl:.2f} | {len(positions)-len(blue)} red remain...")
-        closed = close_positions_parallel(blue)
-        print(f"   ✅ Sniped {closed} | Banked: +${blue_pnl:.2f}")
-        state["total_trades"]      += closed
-        state["total_greedy_wins"] += closed
-        state["total_wins"]        += closed
-        remaining = [p for p in get_bot_positions() if p.type == direction]
-        state[f"{dir_key}_deep_level"] = max(0, len(remaining) - burst_lvls)
-        save_state(state)
-        return True
-
-    # ── DEEP LEVEL ───────────────────────────────────────────
-    _try_deep_level(state, direction, positions)
-
-    # ── STATUS (throttled — only print when P&L moves $1+) ──────
-    symbol_info = mt5.symbol_info(CONFIG["symbol"])
-    tick        = mt5.symbol_info_tick(CONFIG["symbol"])
-    point       = symbol_info.point if symbol_info else 0.01
-
-    last_pnl_key = f"{dir_key}_last_logged_pnl"
-    last_pnl     = state.get(last_pnl_key)
-    should_log   = (last_pnl is None) or (abs(total_pnl - last_pnl) >= 1.0)
-
-    if should_log and total_lots > 0:
-        weighted_entry = sum(p.price_open * p.volume for p in positions) / total_lots
-        be_dist        = abs(weighted_entry - tick.bid) / point
-        be_dir         = "needs ↑" if direction == BUY else "needs ↓"
-        color          = "🔴" if total_pnl < 0 else "🟡"
-        print(f"\n{color} {dir_str} | P&L: ${total_pnl:.2f} | Lots: {total_lots:.2f} | "
-              f"{len(positions)} pos (deep:{deep_level}/{max_deep}) | "
-              f"BE: {weighted_entry:.2f} ({be_dist:.0f}pts {be_dir})")
-        state[last_pnl_key] = total_pnl
-
-    return False
-
-
-# ─────────────────────────────────────────
-#  MAIN ENTRY — one stack at a time, alternating
-# ─────────────────────────────────────────
-def open_greedy_stack(state, ema_timeframe):
-    """
-    Opens ONE stack at a time, alternating BUY → SELL → BUY → SELL.
-    """
-    can, reason = _can_enter(state)
-    if not can:
-        print(f"  ⏸️  Entry blocked: {reason}")
-        return False
-
-    # Don't open if any stack is already open
-    if state.get("buy_stack_open") or state.get("sell_stack_open"):
-        # Only warn if the flag is STALE (flagged open but no real positions)
-        real_positions = get_bot_positions()
-        has_buys  = any(p.type == BUY  for p in real_positions)
-        has_sells = any(p.type == SELL for p in real_positions)
-        if state.get("buy_stack_open") and not has_buys:
-            print(f"  ⚠️  buy_stack_open was stale — auto-clearing")
-            state["buy_stack_open"]      = False
-            state["buy_deep_level"]      = 0
-            state["buy_last_deep_price"] = None
-            save_state(state)
-        elif state.get("sell_stack_open") and not has_sells:
-            print(f"  ⚠️  sell_stack_open was stale — auto-clearing")
-            state["sell_stack_open"]      = False
-            state["sell_deep_level"]      = 0
-            state["sell_last_deep_price"] = None
-            save_state(state)
+    NUM_POSITIONS = 1  # open 3 × 0.01 lots = 0.03 total (~$0.24 TP, ~$0.15 SL)
+    tickets = []
+    for i in range(NUM_POSITIONS):
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            tickets.append(result.order)
         else:
-            # Stack genuinely open — silently wait (no spam)
-            return False
-        return False
+            code = result.retcode if result else "None"
+            print(f"  ❌ Order {i+1} failed | retcode: {code}")
 
-    ok, filter_reason = check_market_filters(ema_timeframe)
-    if not ok:
-        print(f"\n⏳ FILTER BLOCK | {filter_reason}")
-        return False
-
-    # Determine direction
-    last = state.get("last_stack_direction")
-
-    if last is None:
-        print(f"  🔍 First entry — checking EMA direction...")
-        direction, ema_val = get_trend_direction()
-        if direction is None:
-            print(f"  ⚠️  EMA returned None — cannot determine direction, skipping")
-            return False
-        print(f"  ✅ EMA direction: {'BUY 📈' if direction == BUY else 'SELL 📉'}")
+    if tickets:
+        print(f"  ✅ {len(tickets)}/{NUM_POSITIONS} orders placed | Tickets: {tickets}")
+        state["position_open"]        = True
+        state["position_ticket"]      = tickets[0]
+        state["position_tickets"]     = tickets
+        state["position_entry_price"] = price
+        state["position_direction"]   = direction
+        state["last_entry_time"]      = time.time()
+        state["total_trades"]         = state.get("total_trades", 0) + 1
+        save_state(state)
+        return True
     else:
-        direction = SELL if last == BUY else BUY
-        dir_str   = "BUY 📈" if direction == BUY else "SELL 📉"
-        print(f"\n🔄 ALTERNATING → {dir_str} (last was {'BUY' if last == BUY else 'SELL'})")
-
-    print(f"  🚀 Opening stack...")
-    return _open_stack(state, direction, ema_timeframe)
+        print(f"  ❌ All orders failed")
+        return False
 
 
 # ─────────────────────────────────────────
-#  MAIN GREEDY LOOP
+#  CHECK IF OPEN POSITION CLOSED (TP/SL hit)
 # ─────────────────────────────────────────
-def check_greedy(state, ema_timeframe):
+def _check_open_position(state):
     """
-    Called every poll tick.
-    Manages BUY stack and SELL stack independently.
+    Monitors the open position.
+    If closed (TP or SL hit by MT5), updates state.
+    Returns True if still open, False if closed.
     """
-    if state["phase"] != PHASE_GREEDY:
+    ticket    = state.get("position_ticket")
+    tickets   = state.get("position_tickets", [ticket] if ticket else [])
+    positions = get_bot_positions()
+    still_open = any(p.ticket in tickets for p in positions) if tickets else False
+
+    if not still_open and state.get("position_open"):
+        # Find the closing deal in history
+        time.sleep(1.0)  # wait for broker to register the deal
+        from_time = int(state.get("last_entry_time", time.time() - 300)) - 10
+        to_time   = int(time.time()) + 10
+        deals     = mt5.history_deals_get(from_time, to_time)
+
+        pnl = None
+        if deals:
+            # Primary: match by position_id (MT5 closing deals carry position_id = opening ticket)
+            for d in reversed(list(deals)):
+                if d.magic != CONFIG["magic"]:
+                    continue
+                if d.entry != 1:  # 1 = EXIT deal
+                    continue
+                if ticket and d.position_id == ticket:
+                    pnl = d.profit + d.swap + d.commission
+                    break
+
+            # Fallback: most recent EXIT deal with our magic
+            if pnl is None:
+                for d in reversed(list(deals)):
+                    if d.magic == CONFIG["magic"] and d.entry == 1:
+                        pnl = d.profit + d.swap + d.commission
+                        break
+
+        if pnl is None:
+            # Last resort: compare close price vs entry price (handles manual closes)
+            entry_price = state.get("position_entry_price")
+            direction   = state.get("position_direction")
+            # Try to get close price from the most recent deal by position_id
+            close_price = None
+            if deals and ticket:
+                for d in reversed(list(deals)):
+                    if d.position_id == ticket:
+                        close_price = d.price
+                        break
+            if entry_price and close_price and direction is not None:
+                if direction == BUY:
+                    pnl = 1.0 if close_price > entry_price else -1.0
+                else:
+                    pnl = 1.0 if close_price < entry_price else -1.0
+                result_str = "WIN" if pnl > 0 else "LOSS"
+                print(f"  ⚠️  Deal P&L not found — determined by price: entry={entry_price:.2f} close={close_price:.2f} → {result_str}")
+            else:
+                pnl = 0.0
+                print(f"  ⚠️  Could not determine outcome — counting as neutral (no stats update)")
+
+        if pnl > 0:
+            win_type = "RECOVERY WIN 🎉" if state.get("recovery_mode") else "Normal win ✅"
+            print(f"\n✅ TRADE CLOSED | +${pnl:.2f} | {win_type}")
+            state["total_wins"]       = state.get("total_wins", 0) + 1
+            state["recovery_mode"]    = False
+            state["last_loss_amount"] = 0.0
+        elif pnl == 0.0:
+            print(f"\n⚪ TRADE CLOSED | Outcome unknown — stats unchanged")
+        else:
+            loss_amt = abs(pnl)
+            print(f"\n❌ LOSS | -${loss_amt:.2f} | Entering recovery mode (next TP = ${loss_amt * CONFIG['tp_recovery_multiplier']:.2f})")
+            state["recovery_mode"]    = True
+            state["last_loss_amount"] = loss_amt
+            state["daily_loss_today"] = state.get("daily_loss_today", 0.0) + loss_amt
+            print(f"  📊 Daily loss: -${state['daily_loss_today']:.2f} / limit -${CONFIG['daily_loss_limit']:.2f}")
+
+        state["position_open"]   = False
+        state["position_ticket"] = None
+        state["last_close_time"] = time.time()
+        invalidate_filter_cache()
+        save_state(state)
+        return False
+
+    return still_open
+
+
+# ─────────────────────────────────────────
+#  MAIN ENTRY POINT — called every poll tick
+# ─────────────────────────────────────────
+def open_greedy_stack(state, ema_timeframe=None):
+    """Called when no position is open — wait for signal and enter."""
+    global _last_entry_candle
+
+    if _check_daily_limit(state):
+        return False
+
+    if _account_emergency(state):
+        return False
+
+    # Cooldown after last close
+    if time.time() - state.get("last_close_time", 0) < CONFIG["reentry_cooldown"]:
+        return False
+
+    # Emergency cooldown
+    last_emerg = state.get("last_emergency_time", 0)
+    if last_emerg > 0 and (time.time() - last_emerg) < CONFIG["emergency_cooldown"]:
+        return False
+
+    # Only act when a new M1 candle has just closed
+    if not is_new_candle():
+        return False
+
+    direction, score, reason = get_signal()
+    min_score = CONFIG["signal_strength_min"]
+
+    print(f"\n📊 SIGNAL | {reason}")
+
+    if direction is None or score < min_score:
+        print(f"  ⏭️  Score {score}/{min_score} — skip")
+        return False
+
+    return _place_smart_trade(state, direction)
+
+
+def check_greedy(state, ema_timeframe=None):
+    """Called every poll tick when a position IS open."""
+    if _account_emergency(state):
+        return
+    if _check_open_position(state):
+        _trail_stop(state)
+
+
+def _trail_stop(state):
+    """
+    Trailing stop logic — runs while position is open.
+    +80pts → move SL to breakeven
+    +120pts → trail SL 50pts behind price
+    """
+    import bot_mt5 as bmt5
+
+    ticket    = state.get("position_ticket")
+    direction = state.get("position_direction")
+    entry     = state.get("position_entry_price")
+    if not ticket or direction is None or not entry:
         return
 
     positions = get_bot_positions()
-    if not positions:
-        # Both stacks closed — reset and wait
-        state["buy_stack_open"]       = False
-        state["buy_deep_level"]       = 0
-        state["buy_last_deep_price"]  = None
-        state["sell_stack_open"]      = False
-        state["sell_deep_level"]      = 0
-        state["sell_last_deep_price"] = None
-        state["last_close_time"]      = time.time()
-        invalidate_filter_cache()
-        save_state(state)
+    tickets = state.get("position_tickets", [ticket] if ticket else [])
+    pos = next((p for p in positions if p.ticket in tickets), None)
+    if not pos:
         return
 
-    # ── ACCOUNT EMERGENCY (kills everything) ─────────────────
-    if _account_emergency(state):
+    symbol = CONFIG["symbol"]
+    info   = mt5.symbol_info(symbol)
+    tick   = mt5.symbol_info_tick(symbol)
+    point  = info.point
+
+    current_price = tick.bid if direction == BUY else tick.ask
+    profit_pts    = ((current_price - entry) / point) if direction == BUY else ((entry - current_price) / point)
+
+    new_sl = None
+
+    if profit_pts >= 1200:
+        # Trail SL 50pts behind current price
+        trail_sl = (current_price - 50 * point) if direction == BUY else (current_price + 50 * point)
+        trail_sl = round(trail_sl, 2)
+        # Only move SL if it's better than current SL
+        if direction == BUY and trail_sl > pos.sl:
+            new_sl = trail_sl
+        elif direction == SELL and trail_sl < pos.sl:
+            new_sl = trail_sl
+
+    elif profit_pts >= 800:
+        # Move SL to breakeven
+        be_sl = round(entry, 2)
+        if direction == BUY and be_sl > pos.sl:
+            new_sl = be_sl
+        elif direction == SELL and be_sl < pos.sl:
+            new_sl = be_sl
+
+    if new_sl is None:
         return
 
-    # ── MANAGE THE ONE OPEN STACK ────────────────────────────
-    buy_positions  = _buy_positions(positions)
-    sell_positions = _sell_positions(positions)
-
-    # Only one of these will have positions at any time
-    if buy_positions:
-        _manage_stack(state, BUY, buy_positions)
-    elif sell_positions:
-        _manage_stack(state, SELL, sell_positions)
-
-    # ── UPDATE STACK FLAGS based on what's still open ────────
-    remaining       = get_bot_positions()
-    remaining_buys  = _buy_positions(remaining)
-    remaining_sells = _sell_positions(remaining)
-
-    if not remaining_buys and state.get("buy_stack_open"):
-        state["buy_stack_open"] = False
-        save_state(state)
-
-    if not remaining_sells and state.get("sell_stack_open"):
-        state["sell_stack_open"] = False
-        save_state(state)
+    # Send SL modification
+    filling = bmt5.FILLING_MODE
+    result  = mt5.order_send({
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "symbol":   symbol,
+        "position": ticket,
+        "sl":       new_sl,
+        "tp":       pos.tp,
+    })
+    if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+        label = "breakeven" if profit_pts < 120 else f"trailing ({new_sl:.2f})"
+        print(f"  🔒 SL moved to {label} | profit: +{profit_pts:.0f}pts")
