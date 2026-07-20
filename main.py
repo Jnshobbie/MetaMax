@@ -85,6 +85,7 @@ def bot_loop():
     state["daily_loss_date"]  = state.get("daily_loss_date", "")
     state["total_trades"]     = 0
     state["total_wins"]       = 0
+    state["bot_start_time"] = time.time()
     save_state(state)
 
     # Clear orphan position flags if no open positions found

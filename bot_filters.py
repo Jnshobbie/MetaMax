@@ -9,6 +9,7 @@ import time
 from bot_config import CONFIG
 
 _last_candle_time = 0
+_consecutive_signals = []  # tracks last 3 signal directions
 
 
 def _calc_ema(closes, period):
@@ -149,6 +150,19 @@ def get_signal():
     # Case 5: Everything else — too weak
     else:
         return None, 0, f"⏸️  Weak signal — gap={ema_gap:.0f}pts, body={body_pts:.0f}pts — skip"
+
+    # ── Trend shift guard ─────────────────────────────────────
+    global _consecutive_signals
+    _consecutive_signals.append(direction)
+    if len(_consecutive_signals) > 3:
+        _consecutive_signals.pop(0)
+
+    # If last 2+ were opposite direction, force a pause
+    if len(_consecutive_signals) >= 2:
+        last_two = _consecutive_signals[-2:]
+        if last_two[0] != direction and last_two[1] != direction:
+            _consecutive_signals = []  # reset
+            return None, 0, f"⏸️  Trend shift detected — pausing 1 candle to reassess"
 
     reason = f"{strength} {dir_label} | {ema_str} | gap={ema_gap:.0f}pts | {rsi_str} | {candle_str}"
     return direction, score, reason

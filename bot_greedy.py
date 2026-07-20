@@ -276,6 +276,10 @@ def open_greedy_stack(state, ema_timeframe=None):
     """Called when no position is open — wait for signal and enter."""
     global _last_entry_candle
 
+    # Startup warmup — ignore first 2 candles after bot starts
+    if time.time() - state.get("bot_start_time", 0) < 120:
+        return False
+
     if _check_daily_limit(state):
         return False
 
