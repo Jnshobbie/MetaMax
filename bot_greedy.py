@@ -205,12 +205,17 @@ def _check_open_position(state):
         pnl = None
         if deals:
             # Primary: match by position_id (MT5 closing deals carry position_id = opening ticket)
+            # Primary: match by position_id
             for d in reversed(list(deals)):
                 if d.magic != CONFIG["magic"]:
                     continue
                 if d.entry != 1:  # 1 = EXIT deal
                     continue
                 if ticket and d.position_id == ticket:
+                    pnl = d.profit + d.swap + d.commission
+                    break
+                # Also match by order ticket directly
+                if ticket and d.order == ticket:
                     pnl = d.profit + d.swap + d.commission
                     break
 

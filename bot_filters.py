@@ -88,8 +88,17 @@ def get_signal():
     candle_str = f"Candle={'Bull' if candle_dir==0 else 'Bear'}({body_pts:.0f}pts)"
 
     # Skip small/doji candles — unpredictable
+    # Skip small/doji candles — unpredictable
     if body_pts < 30:
         return None, 0, f"⏸️  Candle too small ({body_pts:.0f}pts < 30) — unpredictable, skip"
+
+    # ── Chop filter — is price actually going somewhere? ─────
+    c1 = closes[-2]  # just closed
+    c2 = closes[-3]  # one before
+    c3 = closes[-4]  # two before
+    net_move = abs(c1 - c3) / point
+    if net_move < 200:
+        return None, 0, f"⏸️  Choppy market — net move only {net_move:.0f}pts over 3 candles — skip"
 
     # ── EMA 9/21 — trend filter ───────────────────────────────
     ema_fast = _calc_ema(closes, fast_p)
